@@ -1,0 +1,27 @@
+@import "tailwindcss";
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px; /* For vertical scrollbars */
+  height: 8px; /* For horizontal scrollbars */
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: #2a2f3a; /* Darker track, matches a common dark background color */
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: #555; /* Slightly lighter gray for the thumb */
+  border-radius: 10px;
+  border: 2px solid #2a2f3a; /* Padding around the thumb, matches track background */
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: #777; /* Lighter on hover */
+}
+
+/* For Firefox */
+.custom-scrollbar {
+  scrollbar-width: thin; /* "auto" or "thin" */
+  scrollbar-color: #555 #2a2f3a; /* thumb color track color */
+}
