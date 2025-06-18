@@ -7,18 +7,19 @@ import faiss
 import numpy as np
 import json
 from flask_cors import CORS
-import logging # Import logging module
-from dotenv import load_dotenv # Import load_dotenv
+import logging
+from dotenv import load_dotenv
+import mimetypes # Import mimetypes to determine file type
 
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Load Environment Variables ---
-load_dotenv() # Load environment variables from .env file (should be in Server/python_api)
+load_dotenv()
 
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
-CORS(app) # Enable CORS for all routes
+CORS(app)
 
 # --- DIRECTORY PATHS ---
 DOCUMENTS_DIR = "documents"
@@ -34,34 +35,31 @@ os.makedirs(VECTORSTORE_DIR, exist_ok=True)
 embedder = None
 documents = [] # Stores the text chunks
 faiss_index = None
-# Initialize the Gemini model globally (recommended for performance)
-# but configured with API key check for robustness
 gemini_model = None
 
 # --- FUNCTION TO CONFIGURE GEMINI API & MODEL ---
 def configure_gemini():
     global gemini_model
-    api_key = os.getenv("GEMINI_API_KEY") # Get API key from environment variable
+    api_key = os.getenv("GEMINI_API_KEY")
 
     if not api_key:
         logging.error("CRITICAL ERROR: GEMINI_API_KEY environment variable not set. AI functionalities will not work.")
-        return False # Indicate failure
+        return False
     try:
         genai.configure(api_key=api_key)
-        # Use the correct model name. 'gemini-1.5-flash-latest' is good.
+        # Using gemini-1.5-flash-latest which supports multimodal input
         gemini_model = genai.GenerativeModel('gemini-1.5-flash-latest')
         logging.info("Gemini API and model configured successfully.")
-        return True # Indicate success
+        return True
     except Exception as e:
         logging.error(f"Error configuring Gemini API or loading model: {e}")
-        gemini_model = None # Ensure it's None on failure
-        return False # Indicate failure
+        gemini_model = None
+        return False
 
 # --- FUNCTION TO LOAD OR CREATE VECTOR STORE ---
 def load_or_create_vectorstore():
     global embedder, documents, faiss_index
 
-    # Initialize embedder once (moved before the check for existing files)
     if embedder is None:
         logging.info("Loading SentenceTransformer model...")
         embedder = SentenceTransformer("all-MiniLM-L6-v2")
@@ -84,19 +82,14 @@ def load_or_create_vectorstore():
 def rebuild_vectorstore():
     global documents, faiss_index
 
-    # Path to the sample document
     sample_doc_path = os.path.join(DOCUMENTS_DIR, "sample.txt")
 
-    # If sample.txt doesn't exist, create a dummy one for first run
     if not os.path.exists(sample_doc_path):
         logging.info(f"'{sample_doc_path}' not found. Creating a sample document for demonstration.")
         with open(sample_doc_path, "w", encoding="utf-8") as f:
             f.write("A contract is a legally binding agreement between two or more parties. For a contract to be valid and enforceable, several essential elements must generally be present. These include: Offer, Acceptance, Consideration, Mutual Assent, Legal Capacity, and Lawful Object. Contracts can be written, oral, or implied by conduct. However, some types of contracts, such as those involving real estate or those that cannot be performed within one year, may be required by law (Statute of Frauds) to be in writing to be enforceable. Breach of contract occurs when one party fails to fulfill their obligations as specified in the agreement, which can lead to remedies such as damages or specific performance.\n\n")
             f.write("In tort law, negligence is a legal theory under which a person can be held liable for injuries to another person caused by their failure to exercise reasonable care. To prove negligence, a plaintiff typically must establish four key elements: Duty of Care, Breach of Duty, Causation, and Damages. Defenses to negligence claims can include contributory negligence or assumption of risk.\n\n")
             f.write("Copyright law grants creators of original works of authorship exclusive rights to their works, such as books, music, and films. Protection arises automatically once an original work is fixed in a tangible medium. Exclusive rights include reproduction, distribution, performance, and display. Limitations like 'fair use' allow certain uses without permission. The duration of copyright typically lasts for the life of the author plus 70 years.\n\n")
-            # Added some general knowledge examples to sample.txt, this makes the RAG
-            # answer these specific general questions, rather than falling back.
-            # If you want it to fallback for these, remove them from here.
             f.write("A car, or automobile, is a wheeled motor vehicle used for transportation.\n\n")
             f.write("Retrieval-Augmented Generation (RAG) is an AI framework that retrieves facts from an external knowledge base to ground large language models (LLMs) on authoritative sources and prevent hallucination.\n\n")
             f.write("MongoDB is a popular NoSQL database that uses JSON-like documents with optional schemas.\n\n")
@@ -105,17 +98,16 @@ def rebuild_vectorstore():
         logging.info(f"Sample '{sample_doc_path}' created.")
 
     with open(sample_doc_path, "r", encoding="utf-8") as f:
-        # Simple chunking: split by double newline. Adjust as needed for larger/more complex docs.
         raw_text = f.read()
         documents = [chunk.strip() for chunk in raw_text.split("\n\n") if chunk.strip()]
 
     if not documents:
         logging.warning("No documents loaded from 'sample.txt'. RAG system will not function as expected.")
-        # Initialize an empty index if no documents to prevent errors
-        # Use a default embedding dimension if no documents for initial setup.
-        # This dimension (384 for "all-MiniLM-L6-v2") needs to be known or dynamically determined.
-        # It's safer to ensure embedder is loaded first.
-        faiss_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
+        if embedder is not None:
+             faiss_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
+        else:
+             logging.error("Embedder not initialized, cannot create empty FAISS index.")
+             faiss_index = None
     else:
         logging.info(f"Embedding {len(documents)} document chunks...")
         doc_embeddings = embedder.encode(documents, convert_to_numpy=True)
@@ -124,15 +116,13 @@ def rebuild_vectorstore():
         faiss_index.add(doc_embeddings)
         logging.info("FAISS index built.")
 
-        # Save the FAISS index and the document chunks for persistence
         faiss.write_index(faiss_index, FAISS_INDEX_PATH)
         with open(DOCUMENTS_LIST_PATH, "w", encoding="utf-8") as f:
             json.dump(documents, f)
         logging.info(f"Vector store with {len(documents)} document chunks saved to '{VECTORSTORE_DIR}'.")
 
 # --- INITIALIZATION CALLS ---
-# Call these functions once when the script starts
-if configure_gemini(): # Only proceed if Gemini is configured successfully
+if configure_gemini():
     load_or_create_vectorstore()
 else:
     logging.error("Gemini API not configured. RAG and direct AI calls will fail.")
@@ -141,23 +131,20 @@ else:
 # --- RETRIEVAL FUNCTION ---
 def retrieve_chunks(query, top_k=3):
     if embedder is None or faiss_index is None or not documents:
-        logging.warning("RAG system not fully initialized. Cannot retrieve chunks.")
+        logging.warning("RAG system not fully initialized or no documents. Cannot retrieve chunks.")
         return []
 
     try:
         q_emb = embedder.encode([query], convert_to_numpy=True)
-        # Ensure q_emb is 2D array for FAISS search (already handled by convert_to_numpy=True)
 
-        # Check if query embedding dimension matches index dimension
         if q_emb.shape[1] != faiss_index.d:
             logging.error(f"Error: Query embedding dimension ({q_emb.shape[1]}) does not match index dimension ({faiss_index.d}). Rebuilding index might be necessary if model changed.")
             return []
 
-        # Ensure top_k does not exceed the number of available documents
         actual_top_k = min(top_k, len(documents))
         if actual_top_k == 0:
             logging.info("No documents to retrieve from.")
-            return [] # No documents to retrieve from
+            return []
 
         _, indices = faiss_index.search(q_emb, actual_top_k)
         retrieved_chunks = [documents[i] for i in indices[0]]
@@ -172,57 +159,156 @@ def retrieve_chunks(query, top_k=3):
 def rag_chat():
     global gemini_model
 
-    prompt = request.json.get("prompt")
-    if not prompt:
-        return jsonify({"error": "Prompt is required"}), 400
+    prompt = None
+    file_part = None # To hold the Generative Part for multimodal input
 
-    logging.info(f"Received prompt: '{prompt}'")
+    # Determine content type of the request
+    content_type = request.headers.get('Content-Type', '')
+    logging.info(f"Incoming request Content-Type: {content_type}")
+    print(f"DEBUG: Incoming request Content-Type: {content_type}") # Console log
+
+    if content_type.startswith('application/json'):
+        # Handle JSON requests (for text-only prompts)
+        try:
+            data = request.get_json()
+            prompt = data.get("prompt")
+            print(f"DEBUG: Received JSON data: {json.dumps(data)}") # Console log
+            if not prompt:
+                print("DEBUG: Prompt is missing in JSON payload.") # Console log
+                return jsonify({"error": "Prompt is required in JSON payload"}), 400
+            logging.info("Received JSON request.")
+        except Exception as e:
+            logging.error(f"Error parsing JSON request: {e}")
+            print(f"DEBUG: Error parsing JSON request: {e}") # Console log
+            return jsonify({"error": "Invalid JSON payload"}), 400
+    elif content_type.startswith('multipart/form-data'):
+        # Handle form-data requests (for prompts with files)
+        prompt = request.form.get("prompt")
+        uploaded_file = request.files.get("file")
+
+        print(f"DEBUG: Received form data - Prompt: '{prompt}', File: '{uploaded_file.filename if uploaded_file else 'None'}'") # Console log
+
+        if not prompt:
+            if not uploaded_file:
+                 print("DEBUG: Prompt is missing and no file uploaded in multipart request.") # Console log
+                 return jsonify({"error": "Prompt is required when no file is uploaded"}), 400
+            else:
+                 prompt = "" # Allow empty prompt if file is present (e.g., "describe this image")
+                 print("DEBUG: Empty prompt allowed because a file is present.") # Console log
+
+        if uploaded_file:
+            filename = uploaded_file.filename
+            uploaded_file_mime_type = mimetypes.guess_type(filename)[0] or uploaded_file.mimetype
+            logging.info(f"Received file: {filename} ({uploaded_file_mime_type})")
+            print(f"DEBUG: Processing uploaded file: {filename}, MIME type: {uploaded_file_mime_type}") # Console log
+
+            if uploaded_file_mime_type and uploaded_file_mime_type.startswith('image/'):
+                try:
+                    file_bytes = uploaded_file.read()
+                    file_part = {
+                        'mime_type': uploaded_file_mime_type,
+                        'data': file_bytes
+                    }
+                    logging.info(f"Image file '{filename}' converted to Generative Part.")
+                    print(f"DEBUG: Image file '{filename}' read. Size: {len(file_bytes)} bytes.") # Console log
+                except Exception as e:
+                    logging.error(f"Error processing image file '{filename}': {e}")
+                    print(f"DEBUG: Error processing image file '{filename}': {e}") # Console log
+                    return jsonify({"error": f"Error processing image file: {e}"}), 400
+            elif uploaded_file_mime_type and uploaded_file_mime_type.startswith('text/'):
+                try:
+                    file_content = uploaded_file.read().decode('utf-8')
+                    prompt = f"{prompt}\n\nAdditional context from uploaded file '{filename}':\n{file_content}"
+                    logging.info(f"Text file '{filename}' content incorporated into prompt.")
+                    print(f"DEBUG: Text file '{filename}' content incorporated into prompt. New prompt length: {len(prompt)}") # Console log
+                except Exception as e:
+                    logging.error(f"Error reading text file '{filename}': {e}")
+                    print(f"DEBUG: Error reading text file '{filename}': {e}") # Console log
+                    return jsonify({"error": f"Error processing text file: {e}"}), 400
+            else:
+                logging.warning(f"Unsupported file type for direct RAG or multimodal processing: {uploaded_file_mime_type}. File will be ignored for enhanced context.")
+                print(f"DEBUG: Unsupported file type '{uploaded_file_mime_type}'. File ignored.") # Console log
+        logging.info("Received multipart/form-data request.")
+    else:
+        print("DEBUG: Unsupported content type detected.") # Console log
+        return jsonify({"error": "Unsupported request content type. Please send 'application/json' or 'multipart/form-data'."}), 400
 
     if gemini_model is None:
+        print("DEBUG: Gemini model is not initialized.") # Console log
         return jsonify({"error": "AI service not initialized on the server."}), 503
 
-    chunks = retrieve_chunks(prompt, top_k=3) # Retrieve top 3 relevant chunks
+    # Prepare content for Gemini based on whether a file part exists
+    contents_to_gemini = []
 
-    final_prompt = prompt # Default to original prompt for fallback
+    # Add the prompt first
+    if prompt:
+        contents_to_gemini.append(prompt)
+        print(f"DEBUG: Appending prompt to Gemini input: '{prompt[:50]}...'") # Console log
 
-    if chunks:
-        context = "\n\n".join(chunks)
-        # Explicitly instruct Gemini to use the context or state it can't answer
-        final_prompt = f"Answer the following question only using the provided context. If the answer cannot be found in the context, state 'I don't have enough information to answer that based on the provided context.' Do not use external knowledge.\n\nContext:\n{context}\n\nQuestion: {prompt}\n\nAnswer:"
-        logging.info("Using RAG context for prompt.")
+    # Add the file part if it exists
+    if file_part:
+        contents_to_gemini.append(file_part)
+        print(f"DEBUG: Appending file part to Gemini input. MIME type: {file_part['mime_type']}") # Console log
+
+    if not contents_to_gemini:
+        print("DEBUG: No prompt or file content to send to Gemini.") # Console log
+        return jsonify({"error": "No prompt or file content provided."}), 400
+
+    # Retrieve chunks only if it's a text-based prompt or text file (not image)
+    rag_context = ""
+    if prompt and not file_part: # Only run RAG if it's a text prompt without an image
+        print(f"DEBUG: Attempting RAG retrieval for text prompt: '{prompt[:50]}...'") # Console log
+        chunks = retrieve_chunks(prompt, top_k=3)
+        if chunks:
+            rag_context = "\n\n".join(chunks)
+            logging.info("Using RAG context for prompt.")
+            print(f"DEBUG: RAG context retrieved. First chunk: '{chunks[0][:50]}...'") # Console log
+        else:
+            logging.info("No relevant chunks found. Relying on Gemini's general knowledge.")
+            print("DEBUG: No RAG chunks found.") # Console log
+
+    # Construct the final prompt for Gemini
+    final_gemini_input = []
+    if rag_context:
+        formatted_rag_prompt = f"Answer the following question only using the provided context. If the answer cannot be found in the context, state 'I don't have enough information to answer that based on the provided context.' Do not use external knowledge.\n\nContext:\n{rag_context}\n\nQuestion: {prompt}\n\nAnswer:"
+        final_gemini_input.append(formatted_rag_prompt)
+        print(f"DEBUG: Final Gemini input (with RAG): '{formatted_rag_prompt[:100]}...'") # Console log
     else:
-        logging.info("No relevant chunks found. Falling back to Gemini's general knowledge.")
-        # If no chunks, 'final_prompt' remains the original 'prompt',
-        # allowing Gemini to use its general knowledge.
+        final_gemini_input.append(prompt)
+        print(f"DEBUG: Final Gemini input (without RAG): '{prompt[:100]}...'") # Console log
+
+    if file_part:
+        final_gemini_input.append(file_part)
+        print(f"DEBUG: Final Gemini input also includes file part.") # Console log
 
     try:
-        logging.info(f"Sending prompt to Gemini. Final prompt length: {len(final_prompt)} characters.")
-        response = gemini_model.generate_content(final_prompt)
+        logging.info(f"Sending content to Gemini: {final_gemini_input[0] if isinstance(final_gemini_input[0], str) else '...file data...'}") # Log only first part
+        print(f"DEBUG: Sending content to Gemini: {final_gemini_input}") # Console log, be careful with large file data here
 
-        # Check if response.text exists and is not empty
+        response = gemini_model.generate_content(final_gemini_input)
+
         if hasattr(response, 'text') and response.text.strip():
             response_text = response.text.strip()
-            logging.info(f"Gemini response: {response_text[:100]}...") # Log first 100 chars
+            logging.info(f"Gemini response: {response_text[:100]}...")
+            print(f"DEBUG: Gemini response received: {response_text[:200]}...") # Console log
             return jsonify({"response": response_text})
         else:
             logging.warning("Gemini API returned an empty or non-text response.")
+            print("DEBUG: Gemini API returned an empty or non-text response.") # Console log
             return jsonify({"error": "Gemini API returned an empty or non-text response. This might be due to safety filters or lack of relevant information."}), 500
 
     except genai.types.BlockedPromptException as e:
         logging.error(f"Gemini API blocked the prompt due to safety reasons: {e}")
+        print(f"DEBUG: Gemini API blocked prompt: {e}") # Console log
         return jsonify({"error": f"VirLaw AI: Your prompt was blocked by AI safety features. Please rephrase."}), 400
     except genai.APIError as e:
         logging.error(f"Gemini API specific error: {e}", exc_info=True)
+        print(f"DEBUG: Gemini API error: {e}") # Console log
         return jsonify({"error": f"VirLaw AI: An API error occurred. Please try again. Details: {str(e)}"}), 500
     except Exception as e:
         logging.error(f"Error calling Gemini API: {e}", exc_info=True)
+        print(f"DEBUG: General error calling Gemini API: {e}") # Console log
         return jsonify({"error": f"Failed to get response from Gemini: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    # Ensure this is set correctly before running
-    # If using .env, ensure the .env file is in the Server/python_api directory
-    # os.environ["GEMINI_API_KEY"] = "YOUR_API_KEY_HERE" # Not recommended to hardcode here
-
-    # This call will now use the environment variable
-    # configure_gemini() is called automatically at startup.
     app.run(host="0.0.0.0", port=8000, debug=True)
