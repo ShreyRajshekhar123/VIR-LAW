@@ -133,6 +133,10 @@ const QueryPage = () => {
             loadedMessages
           );
           setMessages(loadedMessages);
+          console.log(
+            "Firestore onSnapshot updated messages state:",
+            loadedMessages
+          ); // Console: Verify messages loaded from Firestore
         },
         (error) => {
           console.error(
@@ -565,6 +569,7 @@ const QueryPage = () => {
       );
 
       setIsLoadingResponse(true);
+      console.log("AI typing indicator set to true.");
 
       let aiResponseText =
         "An error occurred while getting a response from VirLaw AI.";

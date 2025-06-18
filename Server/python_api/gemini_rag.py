@@ -35,6 +35,8 @@ os.makedirs(VECTORSTORE_DIR, exist_ok=True)
 embedder = None
 documents = [] # Stores the text chunks
 faiss_index = None
+# Initialize the Gemini model globally (recommended for performance)
+# but configured with API key check for robustness
 gemini_model = None
 
 # --- FUNCTION TO CONFIGURE GEMINI API & MODEL ---
@@ -90,6 +92,9 @@ def rebuild_vectorstore():
             f.write("A contract is a legally binding agreement between two or more parties. For a contract to be valid and enforceable, several essential elements must generally be present. These include: Offer, Acceptance, Consideration, Mutual Assent, Legal Capacity, and Lawful Object. Contracts can be written, oral, or implied by conduct. However, some types of contracts, such as those involving real estate or those that cannot be performed within one year, may be required by law (Statute of Frauds) to be in writing to be enforceable. Breach of contract occurs when one party fails to fulfill their obligations as specified in the agreement, which can lead to remedies such as damages or specific performance.\n\n")
             f.write("In tort law, negligence is a legal theory under which a person can be held liable for injuries to another person caused by their failure to exercise reasonable care. To prove negligence, a plaintiff typically must establish four key elements: Duty of Care, Breach of Duty, Causation, and Damages. Defenses to negligence claims can include contributory negligence or assumption of risk.\n\n")
             f.write("Copyright law grants creators of original works of authorship exclusive rights to their works, such as books, music, and films. Protection arises automatically once an original work is fixed in a tangible medium. Exclusive rights include reproduction, distribution, performance, and display. Limitations like 'fair use' allow certain uses without permission. The duration of copyright typically lasts for the life of the author plus 70 years.\n\n")
+            # Added some general knowledge examples to sample.txt, this makes the RAG
+            # answer these specific general questions, rather than falling back.
+            # If you want it to fallback for these, remove them from here.
             f.write("A car, or automobile, is a wheeled motor vehicle used for transportation.\n\n")
             f.write("Retrieval-Augmented Generation (RAG) is an AI framework that retrieves facts from an external knowledge base to ground large language models (LLMs) on authoritative sources and prevent hallucination.\n\n")
             f.write("MongoDB is a popular NoSQL database that uses JSON-like documents with optional schemas.\n\n")
@@ -98,6 +103,7 @@ def rebuild_vectorstore():
         logging.info(f"Sample '{sample_doc_path}' created.")
 
     with open(sample_doc_path, "r", encoding="utf-8") as f:
+        # Simple chunking: split by double newline. Adjust as needed for larger/more complex docs.
         raw_text = f.read()
         documents = [chunk.strip() for chunk in raw_text.split("\n\n") if chunk.strip()]
 
@@ -108,6 +114,11 @@ def rebuild_vectorstore():
         else:
              logging.error("Embedder not initialized, cannot create empty FAISS index.")
              faiss_index = None
+        # Initialize an empty index if no documents to prevent errors
+        # Use a default embedding dimension if no documents for initial setup.
+        # This dimension (384 for "all-MiniLM-L6-v2") needs to be known or dynamically determined.
+        # It's safer to ensure embedder is loaded first.
+        faiss_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
     else:
         logging.info(f"Embedding {len(documents)} document chunks...")
         doc_embeddings = embedder.encode(documents, convert_to_numpy=True)
@@ -116,13 +127,14 @@ def rebuild_vectorstore():
         faiss_index.add(doc_embeddings)
         logging.info("FAISS index built.")
 
+        # Save the FAISS index and the document chunks for persistence
         faiss.write_index(faiss_index, FAISS_INDEX_PATH)
         with open(DOCUMENTS_LIST_PATH, "w", encoding="utf-8") as f:
             json.dump(documents, f)
         logging.info(f"Vector store with {len(documents)} document chunks saved to '{VECTORSTORE_DIR}'.")
 
 # --- INITIALIZATION CALLS ---
-if configure_gemini():
+if configure_gemini(): # Only proceed if Gemini is configured successfully
     load_or_create_vectorstore()
 else:
     logging.error("Gemini API not configured. RAG and direct AI calls will fail.")
@@ -132,11 +144,15 @@ else:
 def retrieve_chunks(query, top_k=3):
     if embedder is None or faiss_index is None or not documents:
         logging.warning("RAG system not fully initialized or no documents. Cannot retrieve chunks.")
+        logging.warning("RAG system not fully initialized. Cannot retrieve chunks.")
         return []
 
     try:
         q_emb = embedder.encode([query], convert_to_numpy=True)
 
+        # Ensure q_emb is 2D array for FAISS search (already handled by convert_to_numpy=True)
+
+        # Check if query embedding dimension matches index dimension
         if q_emb.shape[1] != faiss_index.d:
             logging.error(f"Error: Query embedding dimension ({q_emb.shape[1]}) does not match index dimension ({faiss_index.d}). Rebuilding index might be necessary if model changed.")
             return []
@@ -145,6 +161,11 @@ def retrieve_chunks(query, top_k=3):
         if actual_top_k == 0:
             logging.info("No documents to retrieve from.")
             return []
+        # Ensure top_k does not exceed the number of available documents
+        actual_top_k = min(top_k, len(documents))
+        if actual_top_k == 0:
+            logging.info("No documents to retrieve from.")
+            return [] # No documents to retrieve from
 
         _, indices = faiss_index.search(q_emb, actual_top_k)
         retrieved_chunks = [documents[i] for i in indices[0]]
