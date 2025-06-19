@@ -11,6 +11,11 @@ import logging
 from dotenv import load_dotenv
 import mimetypes # Import mimetypes to determine file type
 
+# NEW IMPORTS for document upload and advanced chunking
+from werkzeug.utils import secure_filename # For secure filenames
+import pypdf # For PDF parsing
+from langchain_text_splitters import RecursiveCharacterTextSplitter # For LangChain chunking
+
 # --- Configure Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -26,18 +31,19 @@ DOCUMENTS_DIR = "documents"
 VECTORSTORE_DIR = "vectorstore"
 FAISS_INDEX_PATH = os.path.join(VECTORSTORE_DIR, "index.faiss")
 DOCUMENTS_LIST_PATH = os.path.join(VECTORSTORE_DIR, "documents.json")
+# NEW: Directory for user-uploaded documents
+USER_UPLOAD_DIR = "user_uploaded_docs"
 
 # Ensure directories exist
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 os.makedirs(VECTORSTORE_DIR, exist_ok=True)
+os.makedirs(USER_UPLOAD_DIR, exist_ok=True) # Ensure user upload directory exists
 
 # --- GLOBAL VARIABLES FOR RAG COMPONENTS ---
 embedder = None
 documents = [] # Stores the text chunks
 faiss_index = None
-# Initialize the Gemini model globally (recommended for performance)
-# but configured with API key check for robustness
-gemini_model = None
+gemini_model = None # Initialized globally after configuration
 
 # --- FUNCTION TO CONFIGURE GEMINI API & MODEL ---
 def configure_gemini():
@@ -64,25 +70,30 @@ def load_or_create_vectorstore():
 
     if embedder is None:
         logging.info("Loading SentenceTransformer model...")
-        embedder = SentenceTransformer("all-MiniLM-L6-v2")
+        embedder = SentenceTransformer("all-MiniLM-L6-v2") # Using SentenceTransformer
         logging.info("SentenceTransformer model loaded.")
 
     if os.path.exists(FAISS_INDEX_PATH) and os.path.exists(DOCUMENTS_LIST_PATH):
-        logging.info("Loading existing FAISS index and documents...")
+        logging.info("Attempting to load existing FAISS index and documents...")
         try:
             faiss_index = faiss.read_index(FAISS_INDEX_PATH)
             with open(DOCUMENTS_LIST_PATH, "r", encoding="utf-8") as f:
                 documents = json.load(f)
             logging.info(f"Loaded {len(documents)} document chunks and FAISS index from disk.")
+            # Verify index dimension matches embedder
+            if faiss_index.d != embedder.get_sentence_embedding_dimension():
+                logging.warning("FAISS index dimension mismatch with current embedder. Rebuilding from sample.txt...")
+                rebuild_vectorstore_from_sample()
         except Exception as e:
-            logging.error(f"Error loading existing vector store: {e}. Rebuilding...")
-            rebuild_vectorstore()
+            logging.error(f"Error loading existing vector store: {e}. Rebuilding from sample.txt as a fallback...")
+            rebuild_vectorstore_from_sample()
     else:
-        logging.info("Vector store not found. Creating new vector store...")
-        rebuild_vectorstore()
+        logging.info("Vector store not found. Creating new vector store from sample.txt...")
+        rebuild_vectorstore_from_sample()
 
-def rebuild_vectorstore():
-    global documents, faiss_index
+# Renamed from rebuild_vectorstore to specifically handle sample.txt
+def rebuild_vectorstore_from_sample():
+    global documents, faiss_index, embedder
 
     sample_doc_path = os.path.join(DOCUMENTS_DIR, "sample.txt")
 
@@ -92,9 +103,6 @@ def rebuild_vectorstore():
             f.write("A contract is a legally binding agreement between two or more parties. For a contract to be valid and enforceable, several essential elements must generally be present. These include: Offer, Acceptance, Consideration, Mutual Assent, Legal Capacity, and Lawful Object. Contracts can be written, oral, or implied by conduct. However, some types of contracts, such as those involving real estate or those that cannot be performed within one year, may be required by law (Statute of Frauds) to be in writing to be enforceable. Breach of contract occurs when one party fails to fulfill their obligations as specified in the agreement, which can lead to remedies such as damages or specific performance.\n\n")
             f.write("In tort law, negligence is a legal theory under which a person can be held liable for injuries to another person caused by their failure to exercise reasonable care. To prove negligence, a plaintiff typically must establish four key elements: Duty of Care, Breach of Duty, Causation, and Damages. Defenses to negligence claims can include contributory negligence or assumption of risk.\n\n")
             f.write("Copyright law grants creators of original works of authorship exclusive rights to their works, such as books, music, and films. Protection arises automatically once an original work is fixed in a tangible medium. Exclusive rights include reproduction, distribution, performance, and display. Limitations like 'fair use' allow certain uses without permission. The duration of copyright typically lasts for the life of the author plus 70 years.\n\n")
-            # Added some general knowledge examples to sample.txt, this makes the RAG
-            # answer these specific general questions, rather than falling back.
-            # If you want it to fallback for these, remove them from here.
             f.write("A car, or automobile, is a wheeled motor vehicle used for transportation.\n\n")
             f.write("Retrieval-Augmented Generation (RAG) is an AI framework that retrieves facts from an external knowledge base to ground large language models (LLMs) on authoritative sources and prevent hallucination.\n\n")
             f.write("MongoDB is a popular NoSQL database that uses JSON-like documents with optional schemas.\n\n")
@@ -103,24 +111,26 @@ def rebuild_vectorstore():
         logging.info(f"Sample '{sample_doc_path}' created.")
 
     with open(sample_doc_path, "r", encoding="utf-8") as f:
-        # Simple chunking: split by double newline. Adjust as needed for larger/more complex docs.
         raw_text = f.read()
-        documents = [chunk.strip() for chunk in raw_text.split("\n\n") if chunk.strip()]
+
+    # Use LangChain's RecursiveCharacterTextSplitter for sample.txt
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500, # Adjust based on your typical document and desired context
+        chunk_overlap=100, # Overlap helps maintain context between chunks
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""] # Common separators for better chunking
+    )
+    documents = text_splitter.split_text(raw_text)
 
     if not documents:
         logging.warning("No documents loaded from 'sample.txt'. RAG system will not function as expected.")
         if embedder is not None:
-             faiss_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
+            faiss_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
         else:
-             logging.error("Embedder not initialized, cannot create empty FAISS index.")
-             faiss_index = None
-        # Initialize an empty index if no documents to prevent errors
-        # Use a default embedding dimension if no documents for initial setup.
-        # This dimension (384 for "all-MiniLM-L6-v2") needs to be known or dynamically determined.
-        # It's safer to ensure embedder is loaded first.
-        faiss_index = faiss.IndexFlatL2(embedder.get_sentence_embedding_dimension())
+            logging.error("Embedder not initialized, cannot create empty FAISS index.")
+            faiss_index = None
     else:
-        logging.info(f"Embedding {len(documents)} document chunks...")
+        logging.info(f"Embedding {len(documents)} document chunks from sample.txt...")
         doc_embeddings = embedder.encode(documents, convert_to_numpy=True)
         logging.info("Embeddings created. Building FAISS index...")
         faiss_index = faiss.IndexFlatL2(doc_embeddings.shape[1])
@@ -134,25 +144,23 @@ def rebuild_vectorstore():
         logging.info(f"Vector store with {len(documents)} document chunks saved to '{VECTORSTORE_DIR}'.")
 
 # --- INITIALIZATION CALLS ---
+# This block ensures that embedder is loaded and vector store is ready on startup
 if configure_gemini(): # Only proceed if Gemini is configured successfully
     load_or_create_vectorstore()
 else:
     logging.error("Gemini API not configured. RAG and direct AI calls will fail.")
 
-
 # --- RETRIEVAL FUNCTION ---
 def retrieve_chunks(query, top_k=3):
+    global embedder # Ensure embedder is accessible
+
     if embedder is None or faiss_index is None or not documents:
         logging.warning("RAG system not fully initialized or no documents. Cannot retrieve chunks.")
-        logging.warning("RAG system not fully initialized. Cannot retrieve chunks.")
         return []
 
     try:
-        q_emb = embedder.encode([query], convert_to_numpy=True)
+        q_emb = embedder.encode([query], convert_to_numpy=True) # Using SentenceTransformer embedder
 
-        # Ensure q_emb is 2D array for FAISS search (already handled by convert_to_numpy=True)
-
-        # Check if query embedding dimension matches index dimension
         if q_emb.shape[1] != faiss_index.d:
             logging.error(f"Error: Query embedding dimension ({q_emb.shape[1]}) does not match index dimension ({faiss_index.d}). Rebuilding index might be necessary if model changed.")
             return []
@@ -161,21 +169,15 @@ def retrieve_chunks(query, top_k=3):
         if actual_top_k == 0:
             logging.info("No documents to retrieve from.")
             return []
-        # Ensure top_k does not exceed the number of available documents
-        actual_top_k = min(top_k, len(documents))
-        if actual_top_k == 0:
-            logging.info("No documents to retrieve from.")
-            return [] # No documents to retrieve from
 
         _, indices = faiss_index.search(q_emb, actual_top_k)
         retrieved_chunks = [documents[i] for i in indices[0]]
-        logging.info(f"Retrieved {len(retrieved_chunks)} chunks for query.")
         return retrieved_chunks
     except Exception as e:
         logging.error(f"Error during chunk retrieval: {e}", exc_info=True)
         return []
 
-# --- API ROUTE ---
+# --- API ROUTE FOR CHAT (no significant changes here, multimodal handling logic remains) ---
 @app.route("/gemini-rag", methods=["POST"])
 def rag_chat():
     global gemini_model
@@ -211,11 +213,11 @@ def rag_chat():
 
         if not prompt:
             if not uploaded_file:
-                 print("DEBUG: Prompt is missing and no file uploaded in multipart request.") # Console log
-                 return jsonify({"error": "Prompt is required when no file is uploaded"}), 400
+                print("DEBUG: Prompt is missing and no file uploaded in multipart request.") # Console log
+                return jsonify({"error": "Prompt is required when no file is uploaded"}), 400
             else:
-                 prompt = "" # Allow empty prompt if file is present (e.g., "describe this image")
-                 print("DEBUG: Empty prompt allowed because a file is present.") # Console log
+                prompt = "" # Allow empty prompt if file is present (e.g., "describe this image")
+                print("DEBUG: Empty prompt allowed because a file is present.") # Console log
 
         if uploaded_file:
             filename = uploaded_file.filename
@@ -239,6 +241,7 @@ def rag_chat():
             elif uploaded_file_mime_type and uploaded_file_mime_type.startswith('text/'):
                 try:
                     file_content = uploaded_file.read().decode('utf-8')
+                    # Directly append text file content to prompt for Gemini to use as context
                     prompt = f"{prompt}\n\nAdditional context from uploaded file '{filename}':\n{file_content}"
                     logging.info(f"Text file '{filename}' content incorporated into prompt.")
                     print(f"DEBUG: Text file '{filename}' content incorporated into prompt. New prompt length: {len(prompt)}") # Console log
@@ -247,8 +250,8 @@ def rag_chat():
                     print(f"DEBUG: Error reading text file '{filename}': {e}") # Console log
                     return jsonify({"error": f"Error processing text file: {e}"}), 400
             else:
-                logging.warning(f"Unsupported file type for direct RAG or multimodal processing: {uploaded_file_mime_type}. File will be ignored for enhanced context.")
-                print(f"DEBUG: Unsupported file type '{uploaded_file_mime_type}'. File ignored.") # Console log
+                logging.warning(f"Unsupported file type for direct RAG or multimodal processing in /gemini-rag: {uploaded_file_mime_type}. File will be ignored for enhanced context.")
+                print(f"DEBUG: Unsupported file type '{uploaded_file_mime_type}'. File ignored for /gemini-rag context.") # Console log
         logging.info("Received multipart/form-data request.")
     else:
         print("DEBUG: Unsupported content type detected.") # Console log
@@ -275,12 +278,20 @@ def rag_chat():
         print("DEBUG: No prompt or file content to send to Gemini.") # Console log
         return jsonify({"error": "No prompt or file content provided."}), 400
 
-    # Retrieve chunks only if it's a text-based prompt or text file (not image)
+    # Retrieve chunks only if it's a text-based prompt AND not an image/binary file for multimodal
     rag_context = ""
-    if prompt and not file_part: # Only run RAG if it's a text prompt without an image
+    if prompt and not file_part:
         print(f"DEBUG: Attempting RAG retrieval for text prompt: '{prompt[:50]}...'") # Console log
         chunks = retrieve_chunks(prompt, top_k=3)
         if chunks:
+            # --- START MODIFICATION ---
+            logging.info(f"Retrieved {len(chunks)} chunks for query.")
+            for i, chunk_content in enumerate(chunks):
+                logging.info(f"--- Retrieved Chunk {i+1} ---")
+                logging.info(chunk_content)
+                logging.info(f"---------------------------\n")
+            # --- END MODIFICATION ---
+
             rag_context = "\n\n".join(chunks)
             logging.info("Using RAG context for prompt.")
             print(f"DEBUG: RAG context retrieved. First chunk: '{chunks[0][:50]}...'") # Console log
@@ -295,7 +306,7 @@ def rag_chat():
         final_gemini_input.append(formatted_rag_prompt)
         print(f"DEBUG: Final Gemini input (with RAG): '{formatted_rag_prompt[:100]}...'") # Console log
     else:
-        final_gemini_input.append(prompt)
+        final_gemini_input.append(prompt) # If no RAG context, just use the direct prompt
         print(f"DEBUG: Final Gemini input (without RAG): '{prompt[:100]}...'") # Console log
 
     if file_part:
@@ -304,7 +315,7 @@ def rag_chat():
 
     try:
         logging.info(f"Sending content to Gemini: {final_gemini_input[0] if isinstance(final_gemini_input[0], str) else '...file data...'}") # Log only first part
-        print(f"DEBUG: Sending content to Gemini: {final_gemini_input}") # Console log, be careful with large file data here
+        print(f"DEBUG: Sending content to Gemini (first 200 chars or type): {final_gemini_input[0][:200] if isinstance(final_gemini_input[0], str) else type(final_gemini_input[0])}") # Console log, be careful with large file data here
 
         response = gemini_model.generate_content(final_gemini_input)
 
@@ -331,5 +342,120 @@ def rag_chat():
         print(f"DEBUG: General error calling Gemini API: {e}") # Console log
         return jsonify({"error": f"Failed to get response from Gemini: {str(e)}"}), 500
 
+
+# --- NEW API ROUTE: UPLOAD DOCUMENT ---
+# This is the dedicated endpoint for adding new documents to the RAG knowledge base
+def parse_pdf_to_text(filepath):
+    text = ""
+    try:
+        with open(filepath, 'rb') as file:
+            reader = pypdf.PdfReader(file) # Using pypdf for PDF parsing
+            for page_num in range(len(reader.pages)):
+                page = reader.pages[page_num]
+                text += page.extract_text() or "" # extract_text might return None
+        logging.info(f"Successfully extracted text from PDF: {filepath}")
+        return text
+    except Exception as e:
+        logging.error(f"Error parsing PDF file {filepath}: {e}")
+        return None
+
+@app.route("/upload_document", methods=["POST"])
+def upload_document():
+    global documents, faiss_index, embedder # Access global RAG components
+
+    if 'file' not in request.files:
+        logging.warning("No 'file' part in upload request.")
+        return jsonify({"error": "No file part in the request"}), 400
+
+    file = request.files['file']
+    if file.filename == '':
+        logging.warning("No selected file in upload request.")
+        return jsonify({"error": "No selected file"}), 400
+
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(USER_UPLOAD_DIR, filename)
+    file_mime_type = mimetypes.guess_type(filename)[0] or file.mimetype
+
+    try:
+        file.save(filepath)
+        logging.info(f"File '{filename}' saved to {USER_UPLOAD_DIR}")
+
+        extracted_text = None
+        if file_mime_type == 'application/pdf':
+            extracted_text = parse_pdf_to_text(filepath)
+        elif file_mime_type.startswith('text/'):
+            with open(filepath, 'r', encoding='utf-8') as f:
+                extracted_text = f.read()
+        else:
+            logging.warning(f"Unsupported file type for RAG processing: {file_mime_type}. Only PDFs and text files are supported.")
+            os.remove(filepath) # Clean up unsupported file
+            return jsonify({"error": f"Unsupported file type: {file_mime_type}. Only PDF and text files are supported for RAG."}), 400
+
+        if not extracted_text:
+            logging.warning(f"Could not extract text from '{filename}'.")
+            os.remove(filepath)
+            return jsonify({"error": f"Could not extract readable text from the provided file."}), 400
+
+        # --- Chunking with LangChain's RecursiveCharacterTextSplitter ---
+        logging.info(f"Chunking text from '{filename}' using LangChain splitter...")
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, # Experiment with this value for legal documents
+            chunk_overlap=200, # Overlap helps maintain context between chunks
+            length_function=len,
+            separators=["\n\n", "\n", " ", ""] # Common separators for robust splitting
+        )
+        new_chunks = text_splitter.split_text(extracted_text)
+        logging.info(f"Generated {len(new_chunks)} chunks.")
+
+        if not new_chunks:
+            logging.warning(f"No chunks generated from '{filename}'.")
+            os.remove(filepath)
+            return jsonify({"message": f"File '{filename}' processed, but no valid text chunks were generated."}), 200
+
+        # --- Embeddings with SentenceTransformer ---
+        logging.info(f"Generating embeddings for {len(new_chunks)} chunks from '{filename}' using SentenceTransformer...")
+        if embedder is None:
+            logging.error("SentenceTransformer embedder not initialized during document upload.")
+            os.remove(filepath)
+            return jsonify({"error": "Embedding service not ready. Please check server logs."}), 503
+
+        try:
+            new_embeddings = embedder.encode(new_chunks, convert_to_numpy=True)
+        except Exception as e:
+            logging.error(f"Failed to generate embeddings for '{filename}': {e}")
+            os.remove(filepath)
+            return jsonify({"error": f"Failed to generate embeddings for the document: {e}"}), 500
+
+
+        # --- Add to FAISS Index and Update Documents List ---
+        if faiss_index is None: # Initialize FAISS index if it's completely empty
+            logging.info(f"Initializing FAISS index with dimension {new_embeddings.shape[1]}.")
+            faiss_index = faiss.IndexFlatL2(new_embeddings.shape[1])
+            documents = [] # Clear global documents if initializing a new index
+
+        elif faiss_index.d != new_embeddings.shape[1]:
+            logging.error(f"Dimension mismatch: new embeddings ({new_embeddings.shape[1]}) vs FAISS index ({faiss_index.d}). This implies a model change or corruption. Please clear '{VECTORSTORE_DIR}' and restart to rebuild.")
+            os.remove(filepath)
+            return jsonify({"error": "Embedding dimension mismatch. Cannot add to existing index. Please clear 'vectorstore' directory and restart the server."}), 500
+
+        faiss_index.add(new_embeddings)
+        documents.extend(new_chunks) # Add new chunks to the global list
+
+        # --- Persist Changes ---
+        faiss.write_index(faiss_index, FAISS_INDEX_PATH)
+        with open(DOCUMENTS_LIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(documents, f)
+        logging.info(f"Document '{filename}' successfully processed, embeddings added to FAISS, and vector store updated.")
+
+        os.remove(filepath) # Clean up temporary uploaded file
+        return jsonify({"message": f"Document '{filename}' processed and added to RAG knowledge base successfully. Total chunks: {len(documents)}"}), 200
+
+    except Exception as e:
+        logging.error(f"General error during document upload or processing of '{filename}': {e}", exc_info=True)
+        if os.path.exists(filepath):
+            os.remove(filepath) # Ensure cleanup on error
+        return jsonify({"error": f"Failed to process document: {str(e)}"}), 500
+
+# --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8000, debug=True)
